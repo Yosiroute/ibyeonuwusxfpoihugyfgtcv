@@ -1,0 +1,133 @@
+name: Trusted Publisher 
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required to request the OIDC ID token
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      HF_RESOURCE: bim-balle/xet-dedup-oracle-pub
+
+    steps:
+      - name: Dump context (so we can see what claims GH actually minted)
+        run: |
+          echo "repo          : ${{ github.repository }}"
+          echo "ref           : ${{ github.ref }}"
+          echo "workflow name : ${{ github.workflow }}"
+          echo "workflow file : ${{ github.workflow_ref }}"
+          echo "sha           : ${{ github.sha }}"
+          echo "actor         : ${{ github.actor }}"
+
+      - name: Request GitHub Actions OIDC ID token (aud = huggingface.co)
+        id: oidc
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+        run: |
+          set -eu
+          ID_TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://huggingface.co" \
+            | jq -r '.value')
+
+          if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
+            echo "FAIL: did not get an OIDC ID token from GitHub"; exit 1
+          fi
+
+          # Decode the JWT body so we can see exactly what claims we present.
+          BODY_B64=$(echo "$ID_TOKEN" | awk -F. '{print $2}')
+          # pad base64url to base64
+          pad=$(( (4 - ${#BODY_B64} % 4) % 4 ))
+          PAD=$(printf '=%.0s' $(seq 1 $pad))
+          echo "--- OIDC token claims presented to HF ---"
+          echo "${BODY_B64}${PAD}" | tr '_-' '/+' | base64 -d 2>/dev/null \
+            | jq '{iss, aud, sub, repository, repository_owner, ref, workflow, workflow_ref, job_workflow_ref, environment}' \
+            || echo "(claims could not be decoded, raw token length=${#ID_TOKEN})"
+
+          # Mask the token in the log but export it to the next step
+          echo "::add-mask::$ID_TOKEN"
+          echo "id_token=$ID_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Exchange the OIDC token for an HF token
+        id: exchange
+        run: |
+          set -eu
+          RESP=$(curl -sS -X POST "https://huggingface.co/oauth/token" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+                   --arg t "${{ steps.oidc.outputs.id_token }}" \
+                   --arg r "$HF_RESOURCE" \
+                   '{grant_type:"urn:ietf:params:oauth:grant-type:token-exchange",
+                     subject_token_type:"urn:ietf:params:oauth:token-type:id_token",
+                     subject_token:$t,
+                     resource:$r}')")
+
+          echo "--- HF /oauth/token response ---"
+          # Redact the access_token field when printing; keep everything else.
+          echo "$RESP" | jq 'if has("access_token") then .access_token="<redacted>" else . end'
+
+          ERR=$(echo "$RESP" | jq -r '.error // empty')
+          if [ -n "$ERR" ]; then
+            echo "FAIL: token exchange rejected: $ERR"
+            echo "DESC: $(echo "$RESP" | jq -r '.error_description // ""')"
+            exit 1
+          fi
+
+          HF_TOKEN=$(echo "$RESP" | jq -r '.access_token')
+          echo "::add-mask::$HF_TOKEN"
+          echo "hf_token=$HF_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "SUCCESS: HF issued a token for resource=$HF_RESOURCE from workflow file=${{ github.workflow_ref }}"
+
+      - name: Confirm the token scope via whoami-v2
+        env:
+          HF_TOKEN: ${{ steps.exchange.outputs.hf_token }}
+        run: |
+          set -eu
+          echo "--- /api/whoami-v2 with the exchanged token ---"
+          curl -sS -H "Authorization: Bearer $HF_TOKEN" \
+            "https://huggingface.co/api/whoami-v2" \
+            | jq '{name, type, auth}'
+
+      - name: Prove write access by committing one tiny file
+        env:
+          HF_TOKEN: ${{ steps.exchange.outputs.hf_token }}
+        run: |
+          set -eu
+          # Smallest possible writing proof — upload a one-line text file.
+          # Will land on https://huggingface.co/bim-balle/xet-dedup-oracle-pub
+          # under /tp-poc-proof-<sha>.txt
+          pip install --quiet 'huggingface_hub>=0.25'
+          python - <<'PY'
+          import os, textwrap
+          from huggingface_hub import HfApi
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          proof = textwrap.dedent(f"""\
+              Trusted Publisher PoC — unrestricted workflow
+              ---------------------------------------------
+              This file was written to bim-balle/xet-dedup-oracle-pub via a
+              GitHub-Actions OIDC exchange. The HF Trusted Publisher config
+              did not restrict the `workflow` claim, so this workflow file
+              (anything.yml, NOT publish.yml) was accepted.
+              GH repo     : {os.environ.get('GITHUB_REPOSITORY','?')}
+              GH ref      : {os.environ.get('GITHUB_REF','?')}
+              GH workflow : {os.environ.get('GITHUB_WORKFLOW','?')}
+              GH run id   : {os.environ.get('GITHUB_RUN_ID','?')}
+              """)
+          sha = os.environ.get('GITHUB_SHA','0000000')[:7]
+          path = f"tp-poc-proof-{sha}.txt"
+          api.upload_file(
+              path_or_fileobj=proof.encode(),
+              path_in_repo=path,
+              repo_id="bim-balle/xet-dedup-oracle-pub",
+              repo_type="model",
+              commit_message=f"tp-poc: write via unrestricted-workflow OIDC ({sha})",
+          )
+          print(f"WROTE: bim-balle/xet-dedup-oracle-pub/{path}")
+          PY
